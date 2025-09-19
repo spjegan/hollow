@@ -30,6 +30,7 @@ public class HollowUpdatePlanner {
     private final HollowConsumer.BlobRetriever transitionCreator;
     private final HollowConsumer.DoubleSnapshotConfig doubleSnapshotConfig;
     private final HollowConsumer.UpdatePlanBlobVerifier updatePlanBlobVerifier;
+    private final DeltaForkRecoveryStrategy deltaForkRecoveryStrategy;
     
     @Deprecated
     public HollowUpdatePlanner(HollowBlobRetriever blobRetriever) {
@@ -44,17 +45,26 @@ public class HollowUpdatePlanner {
         this(transitionCreator, doubleSnapshotConfig, HollowConsumer.UpdatePlanBlobVerifier.DEFAULT_INSTANCE);
     }
 
+    public HollowUpdatePlanner(HollowConsumer.BlobRetriever transitionCreator,
+                               HollowConsumer.DoubleSnapshotConfig doubleSnapshotConfig,
+                               HollowConsumer.UpdatePlanBlobVerifier updatePlanBlobVerifier) {
+        this(transitionCreator, doubleSnapshotConfig, updatePlanBlobVerifier, new LCAForkRecoveryStrategy());
+    }
+
     /**
      * @param transitionCreator A blob retriever implementation
      * @param doubleSnapshotConfig Double snapshot config
      * @param updatePlanBlobVerifier Update plan config
+     * @param deltaForkRecoveryStrategy Strategy for handling delta fork recovery
      */
     public HollowUpdatePlanner(HollowConsumer.BlobRetriever transitionCreator,
                                HollowConsumer.DoubleSnapshotConfig doubleSnapshotConfig,
-                               HollowConsumer.UpdatePlanBlobVerifier updatePlanBlobVerifier) {
+                               HollowConsumer.UpdatePlanBlobVerifier updatePlanBlobVerifier,
+                               DeltaForkRecoveryStrategy deltaForkRecoveryStrategy) {
         this.transitionCreator = transitionCreator;
         this.doubleSnapshotConfig = doubleSnapshotConfig;
         this.updatePlanBlobVerifier = updatePlanBlobVerifier;
+        this.deltaForkRecoveryStrategy = deltaForkRecoveryStrategy;
     }
 
     /**
@@ -107,6 +117,22 @@ public class HollowUpdatePlanner {
         long deltaDestinationVersion = deltaPlan.destinationVersion(currentVersion);
 
         if(deltaDestinationVersion != desiredVersion && allowSnapshot) {
+            // Try the recovery strategy first
+            HollowUpdatePlan recoveryPlan = deltaForkRecoveryStrategy.createRecoveryPlan(
+                    currentVersion, desiredVersionInfo, transitionCreator, doubleSnapshotConfig, updatePlanBlobVerifier);
+            
+            if (recoveryPlan != null) {
+                long recoveryDestinationVersion = recoveryPlan.destinationVersion(currentVersion);
+                
+                // Use recovery plan if it reaches the desired version or gets closer than the delta plan
+                if (recoveryDestinationVersion == desiredVersion
+                        || ((deltaDestinationVersion > desiredVersion) && (recoveryDestinationVersion < desiredVersion))
+                        || ((recoveryDestinationVersion < desiredVersion) && (recoveryDestinationVersion > deltaDestinationVersion))) {
+                    return recoveryPlan;
+                }
+            }
+            
+            // Fall back to original snapshot plan logic if recovery doesn't help
             HollowUpdatePlan snapshotPlan = snapshotPlan(desiredVersionInfo);
             long snapshotDestinationVersion = snapshotPlan.destinationVersion(currentVersion);
 
@@ -267,5 +293,14 @@ public class HollowUpdatePlanner {
             }
         }
         return HollowConstants.VERSION_LATEST;
+    }
+
+    /**
+     * Returns the delta fork recovery strategy used by this planner.
+     * 
+     * @return the recovery strategy
+     */
+    public DeltaForkRecoveryStrategy getDeltaForkRecoveryStrategy() {
+        return deltaForkRecoveryStrategy;
     }
 }
