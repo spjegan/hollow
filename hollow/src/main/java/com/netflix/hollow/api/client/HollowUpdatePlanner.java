@@ -23,6 +23,25 @@ import java.util.logging.Logger;
 /**
  * The HollowUpdatePlanner defines the logic responsible for interacting with a {@link HollowBlobRetriever} 
  * to create a {@link HollowUpdatePlan}.
+ * 
+ * <p>When a direct delta path cannot reach the desired version, the planner uses a recovery strategy:
+ * <ul>
+ *   <li><b>Default behavior:</b> Uses {@link SnapshotForkRecoveryStrategy} when allowSnapshot=true</li>
+ *   <li><b>Advanced recovery:</b> Uses configured {@link DeltaForkRecoveryStrategy} when allowSnapshot=false</li>
+ *   <li><b>Initialization:</b> Always uses {@link SnapshotForkRecoveryStrategy} for VERSION_NONE</li>
+ * </ul>
+ * 
+ * <p>To use LCA-based recovery instead of the default snapshot approach:
+ * <pre>{@code
+ * // Enable LCA recovery with default config
+ * HollowUpdatePlanner planner = HollowUpdatePlanner.withLCARecovery(blobRetriever);
+ * 
+ * // Custom LCA config
+ * LCAForkRecoveryConfig config = LCAForkRecoveryConfig.builder()
+ *     .withMaxReverseDeltaLookback(50)
+ *     .build();
+ * HollowUpdatePlanner planner = HollowUpdatePlanner.withLCARecovery(blobRetriever, config);
+ * }</pre>
  */
 public class HollowUpdatePlanner {
     private static final Logger LOG = Logger.getLogger(HollowUpdatePlanner.class.getName());
@@ -30,8 +49,9 @@ public class HollowUpdatePlanner {
     private final HollowConsumer.BlobRetriever transitionCreator;
     private final HollowConsumer.DoubleSnapshotConfig doubleSnapshotConfig;
     private final HollowConsumer.UpdatePlanBlobVerifier updatePlanBlobVerifier;
-    private final DeltaForkRecoveryStrategy deltaForkRecoveryStrategy;
-    
+    private final HollowDeltaUpdatePlanner deltaUpdatePlanner;
+    private final DeltaForkRecoveryStrategy snapshotForkRecoveryStrategy;
+
     @Deprecated
     public HollowUpdatePlanner(HollowBlobRetriever blobRetriever) {
         this(HollowClientConsumerBridge.consumerBlobRetrieverFor(blobRetriever));
@@ -48,23 +68,11 @@ public class HollowUpdatePlanner {
     public HollowUpdatePlanner(HollowConsumer.BlobRetriever transitionCreator,
                                HollowConsumer.DoubleSnapshotConfig doubleSnapshotConfig,
                                HollowConsumer.UpdatePlanBlobVerifier updatePlanBlobVerifier) {
-        this(transitionCreator, doubleSnapshotConfig, updatePlanBlobVerifier, new LCAForkRecoveryStrategy());
-    }
-
-    /**
-     * @param transitionCreator A blob retriever implementation
-     * @param doubleSnapshotConfig Double snapshot config
-     * @param updatePlanBlobVerifier Update plan config
-     * @param deltaForkRecoveryStrategy Strategy for handling delta fork recovery
-     */
-    public HollowUpdatePlanner(HollowConsumer.BlobRetriever transitionCreator,
-                               HollowConsumer.DoubleSnapshotConfig doubleSnapshotConfig,
-                               HollowConsumer.UpdatePlanBlobVerifier updatePlanBlobVerifier,
-                               DeltaForkRecoveryStrategy deltaForkRecoveryStrategy) {
         this.transitionCreator = transitionCreator;
         this.doubleSnapshotConfig = doubleSnapshotConfig;
         this.updatePlanBlobVerifier = updatePlanBlobVerifier;
-        this.deltaForkRecoveryStrategy = deltaForkRecoveryStrategy;
+        this.deltaUpdatePlanner = new HollowDeltaUpdatePlanner(transitionCreator);
+        this.snapshotForkRecoveryStrategy = new SnapshotForkRecoveryStrategy(transitionCreator);
     }
 
     /**
@@ -94,12 +102,15 @@ public class HollowUpdatePlanner {
 
     /**
      * Create an update plan from the current version to the desired version.
-     * If the desired version was announced, and if announcement watcher impl has been initialized, the update plan config
-     * will default to snapshot plans only retrieving a snapshot version that was successfully announced.
+     * 
+     * Recovery Strategy Selection:
+     * - If allowSnapshot=true: Uses SnapshotForkRecoveryStrategy for delta fork recovery
+     * - If allowSnapshot=false: Uses the configured deltaForkRecoveryStrategy (typically LCA-based)
+     * - For initialization (currentVersion=VERSION_NONE): Always uses SnapshotForkRecoveryStrategy
      *
      * @param currentVersion - The current version of the hollow state engine, or HollowConstants.VERSION_NONE if not yet initialized
      * @param desiredVersionInfo - The version info to which the hollow state engine should be updated once the resultant steps are applied.
-     * @param allowSnapshot  - Allow a snapshot plan to be created if the destination version is not reachable
+     * @param allowSnapshot - Controls recovery strategy selection when delta plan fails to reach desired version
      * @return the sequence of steps necessary to bring a hollow state engine up to date.
      * @throws Exception if the plan cannot be updated
      */
@@ -109,198 +120,46 @@ public class HollowUpdatePlanner {
         if(desiredVersion == currentVersion)
             return HollowUpdatePlan.DO_NOTHING;
 
-        if (currentVersion == HollowConstants.VERSION_NONE)
-            return snapshotPlan(desiredVersionInfo);
+        if (currentVersion == HollowConstants.VERSION_NONE) {
+            // For initialization, always use snapshot recovery strategy
+            return snapshotForkRecoveryStrategy.createRecoveryPlan(currentVersion, desiredVersionInfo, updatePlanBlobVerifier);
+        }
 
-        HollowUpdatePlan deltaPlan = deltaPlan(currentVersion, desiredVersion, doubleSnapshotConfig.maxDeltasBeforeDoubleSnapshot());
+        HollowUpdatePlan deltaPlan = deltaUpdatePlanner.deltaPlan(currentVersion, desiredVersion, doubleSnapshotConfig.maxDeltasBeforeDoubleSnapshot());
 
         long deltaDestinationVersion = deltaPlan.destinationVersion(currentVersion);
+        if(deltaDestinationVersion != desiredVersion) {
+            DeltaForkRecoveryStrategy deltaForkRecoveryStrategy = resolveForkRecoveryStrategy(allowSnapshot);
+            if (deltaForkRecoveryStrategy != null) {
+                HollowUpdatePlan recoveryPlan = deltaForkRecoveryStrategy.createRecoveryPlan(
+                        currentVersion, desiredVersionInfo, updatePlanBlobVerifier);
 
-        if(deltaDestinationVersion != desiredVersion && allowSnapshot) {
-            // Try the recovery strategy first
-            HollowUpdatePlan recoveryPlan = deltaForkRecoveryStrategy.createRecoveryPlan(
-                    currentVersion, desiredVersionInfo, transitionCreator, doubleSnapshotConfig, updatePlanBlobVerifier);
-            
-            if (recoveryPlan != null) {
-                long recoveryDestinationVersion = recoveryPlan.destinationVersion(currentVersion);
-                
-                // Use recovery plan if it reaches the desired version or gets closer than the delta plan
-                if (recoveryDestinationVersion == desiredVersion
-                        || ((deltaDestinationVersion > desiredVersion) && (recoveryDestinationVersion < desiredVersion))
-                        || ((recoveryDestinationVersion < desiredVersion) && (recoveryDestinationVersion > deltaDestinationVersion))) {
-                    return recoveryPlan;
+                if (recoveryPlan != null) {
+                    long recoveryDestinationVersion = recoveryPlan.destinationVersion(currentVersion);
+
+                    // Use recovery plan if it reaches the desired version or gets closer than the delta plan
+                    if (recoveryDestinationVersion == desiredVersion
+                            || ((deltaDestinationVersion > desiredVersion) && (recoveryDestinationVersion < desiredVersion))
+                            || ((recoveryDestinationVersion < desiredVersion) && (recoveryDestinationVersion > deltaDestinationVersion))) {
+                        return recoveryPlan;
+                    }
                 }
             }
-            
-            // Fall back to original snapshot plan logic if recovery doesn't help
-            HollowUpdatePlan snapshotPlan = snapshotPlan(desiredVersionInfo);
-            long snapshotDestinationVersion = snapshotPlan.destinationVersion(currentVersion);
-
-            if(snapshotDestinationVersion == desiredVersion
-                    || ((deltaDestinationVersion > desiredVersion) && (snapshotDestinationVersion < desiredVersion))
-                    || ((snapshotDestinationVersion < desiredVersion) && (snapshotDestinationVersion > deltaDestinationVersion)))
-
-                return snapshotPlan;
         }
 
         return deltaPlan;
     }
 
-    /**
-     * Returns an update plan that if executed will update the client to a version that is either equal to or as close to but
-     * less than the desired version as possible. This plan normally contains one snapshot transition and zero or more delta
-     * transitions but if no previous versions were found then an empty plan, {@code HollowUpdatePlan.DO_NOTHING}, is returned.
-     * @param desiredVersionInfo Version info for the desired version to which the client wishes to update to, or update to as close to as possible but lesser than this version
-     * @return An update plan containing 1 snapshot transition and 0+ delta transitions if requested versions were found,
-     *         or an empty plan, {@code HollowUpdatePlan.DO_NOTHING}, if no previous versions were found
-     */
-    private HollowUpdatePlan snapshotPlan(HollowConsumer.VersionInfo desiredVersionInfo) {
-        HollowUpdatePlan plan = new HollowUpdatePlan();
-        long desiredVersion = desiredVersionInfo.getVersion();
-        long nearestPreviousSnapshotVersion = includeNearestSnapshot(plan, desiredVersionInfo);
-
-        // The includeNearestSnapshot function returns a  snapshot version that is less than or equal to the desired version
-        if(nearestPreviousSnapshotVersion > desiredVersion)
-            return HollowUpdatePlan.DO_NOTHING;
-
-        // If the nearest snapshot version is {@code HollowConstants.VERSION_LATEST} then no past snapshots were found, so
-        // skip the delta planning and the update plan does nothing
-        if(nearestPreviousSnapshotVersion == HollowConstants.VERSION_LATEST)
-            return HollowUpdatePlan.DO_NOTHING;
-
-        plan.appendPlan(deltaPlan(nearestPreviousSnapshotVersion, desiredVersion, Integer.MAX_VALUE));
-
-        return plan;
-    }
-
-    private HollowUpdatePlan deltaPlan(long currentVersion, long desiredVersion, int maxDeltas) {
-        HollowUpdatePlan plan = new HollowUpdatePlan();
-        if(currentVersion < desiredVersion) {
-            applyForwardDeltasToPlan(currentVersion, desiredVersion, plan, maxDeltas);
-        } else if(currentVersion > desiredVersion) {
-            applyReverseDeltasToPlan(currentVersion, desiredVersion, plan, maxDeltas);
+    private DeltaForkRecoveryStrategy resolveForkRecoveryStrategy(boolean allowSnapshot) {
+        // Prefer snapshot recovery strategy when allowed.
+        if (allowSnapshot) {
+            LOG.fine("Using SnapshotForkRecoveryStrategy for delta fork recovery (allowSnapshot=true)");
+            return new SnapshotForkRecoveryStrategy(transitionCreator);
         }
 
-        return plan;
-    }
-
-    private long applyForwardDeltasToPlan(long currentVersion, long desiredVersion, HollowUpdatePlan plan, int maxDeltas) {
-        int transitionCounter = 0;
-
-        while(currentVersion < desiredVersion && transitionCounter < maxDeltas) {
-            currentVersion = includeNextDelta(plan, currentVersion, desiredVersion);
-            transitionCounter++;
-        }
-        return currentVersion;
-    };
-
-    private long applyReverseDeltasToPlan(long currentVersion, long desiredVersion, HollowUpdatePlan plan, int maxDeltas) {
-        long achievedVersion = currentVersion;
-        int transitionCounter = 0;
-
-        while (currentVersion > desiredVersion && transitionCounter < maxDeltas) {
-            currentVersion = includeNextReverseDelta(plan, currentVersion);
-            if (currentVersion != HollowConstants.VERSION_NONE)
-                achievedVersion = currentVersion;
-            transitionCounter++;
-        }
-
-        return achievedVersion;
-    }
-
-    /**
-     * Includes the next delta only if it will not take us *after* the desired version
-     */
-    private long includeNextDelta(HollowUpdatePlan plan, long currentVersion, long desiredVersion) {
-        HollowConsumer.Blob transition = transitionCreator.retrieveDeltaBlob(currentVersion);
-
-        if(transition != null) {
-            if(transition.getToVersion() <= desiredVersion) {
-                plan.add(transition);
-            }
-
-            return transition.getToVersion();
-        }
-
-        return HollowConstants.VERSION_LATEST;
-    }
-
-    private long includeNextReverseDelta(HollowUpdatePlan plan, long currentVersion) {
-        HollowConsumer.Blob transition = transitionCreator.retrieveReverseDeltaBlob(currentVersion);
-        if(transition != null) {
-            plan.add(transition);
-            return transition.getToVersion();
-        }
-
-        return HollowConstants.VERSION_NONE;
-    }
-
-    private long includeNearestSnapshot(HollowUpdatePlan plan, HollowConsumer.VersionInfo desiredVersionInfo) {
-        long desiredVersion = desiredVersionInfo.getVersion();
-        HollowConsumer.Blob transition = transitionCreator.retrieveSnapshotBlob(desiredVersion);
-        if (transition != null) {
-            // exact match with desired version
-            if (transition.getToVersion() == desiredVersion) {
-                plan.add(transition);
-                return transition.getToVersion();
-            }
-
-            // else if update is to an announced version then add only announced versions to plan
-            if (updatePlanBlobVerifier != null
-                && updatePlanBlobVerifier.announcementVerificationEnabled()
-                && desiredVersionInfo.wasAnnounced() != null
-                && desiredVersionInfo.wasAnnounced().isPresent()
-                && desiredVersionInfo.wasAnnounced().get()) {
-
-                int lookback = 1;
-                int maxLookback = updatePlanBlobVerifier.announcementVerificationMaxLookback();
-                HollowConsumer.AnnouncementWatcher announcementWatcher = updatePlanBlobVerifier.announcementWatcher();
-                while (lookback <= maxLookback) {
-                    HollowConsumer.AnnouncementStatus announcementStatus = announcementWatcher == null
-                            ? HollowConsumer.AnnouncementStatus.UNKNOWN : announcementWatcher.getVersionAnnouncementStatus(transition.getToVersion());
-
-                    if (announcementStatus == null
-                     || announcementStatus.equals(HollowConsumer.AnnouncementStatus.UNKNOWN)
-                     || announcementStatus.equals(HollowConsumer.AnnouncementStatus.ANNOUNCED)) {
-                        // backwards compatibility
-                        if (announcementStatus == HollowConsumer.AnnouncementStatus.UNKNOWN) {
-                            if (announcementWatcher == null) {
-                                LOG.warning("HollowUpdatePlanner was not initialized with an announcement watcher so it does not support getVersionAnnouncementStatus. " +
-                                        "Consumer will continue with the update but runs the risk of consuming a snapshot version that was not announced");
-                            } else {
-                                LOG.warning(String.format("Announcement watcher impl bound (%s) to HollowUpdatePlanner does not support getVersionAnnouncementStatus. " +
-                                        "Consumer will continue with the update but runs the risk of consuming a snapshot version that was not announced", announcementWatcher.getClass().getName()));
-                            }
-                        } else if (announcementStatus == null) {
-                            LOG.warning(String.format("Expecting a valid announcement stats for version(%s), but Announcement watcher impl (%s) " +
-                                    "returned null", transition.getToVersion(), announcementWatcher.getClass().getName()));
-                        }
-                        plan.add(transition);
-                        return transition.getToVersion();
-                    }
-                    lookback ++;
-                    desiredVersion = transition.getToVersion() - 1; // try the next highest snapshot version less than the previous one
-                    transition = transitionCreator.retrieveSnapshotBlob(desiredVersion);
-                    if (transition == null) {
-                        break;
-                    }
-                }
-                LOG.warning("No past snapshot found within lookback period that corresponded to an announced version, maxLookback configured to " + maxLookback);
-            } else {
-                // if desired version is either not an announced version, or unknown whether it is an announced version (e.g. backwards compatibility)
-                plan.add(transition);
-                return transition.getToVersion();
-            }
-        }
-        return HollowConstants.VERSION_LATEST;
-    }
-
-    /**
-     * Returns the delta fork recovery strategy used by this planner.
-     * 
-     * @return the recovery strategy
-     */
-    public DeltaForkRecoveryStrategy getDeltaForkRecoveryStrategy() {
-        return deltaForkRecoveryStrategy;
+        // TODO-Jegan: Check the feature flag before enabling LCA fork recovery strategy.
+//        LOG.fine("Using LCAForkRecoveryStrategy for delta fork recovery (allowSnapshot=false)");
+//        return new LCAForkRecoveryStrategy(transitionCreator, snapshotForkRecoveryStrategy);
+        return null;
     }
 }

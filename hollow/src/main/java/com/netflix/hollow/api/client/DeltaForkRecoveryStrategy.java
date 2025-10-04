@@ -29,8 +29,6 @@ public interface DeltaForkRecoveryStrategy {
      * 
      * @param currentVersion The current version of the hollow state engine
      * @param desiredVersionInfo The version info to which the hollow state engine should be updated
-     * @param blobRetriever The blob retriever for accessing snapshot and delta blobs
-     * @param doubleSnapshotConfig Configuration for double snapshot behavior
      * @param updatePlanBlobVerifier Update plan verifier for blob validation
      * @return A recovery update plan, or null if recovery is not possible
      * @throws Exception if the recovery plan cannot be created
@@ -38,7 +36,5 @@ public interface DeltaForkRecoveryStrategy {
     HollowUpdatePlan createRecoveryPlan(
             long currentVersion,
             HollowConsumer.VersionInfo desiredVersionInfo,
-            HollowConsumer.BlobRetriever blobRetriever,
-            HollowConsumer.DoubleSnapshotConfig doubleSnapshotConfig,
             HollowConsumer.UpdatePlanBlobVerifier updatePlanBlobVerifier) throws Exception;
 }

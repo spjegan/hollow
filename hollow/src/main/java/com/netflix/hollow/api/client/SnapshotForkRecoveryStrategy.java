@@ -1,5 +1,5 @@
 /*
- *  Copyright 2016-2019 Netflix, Inc.
+ *  Copyright 2016-2025 Netflix, Inc.
  *
  *     Licensed under the Apache License, Version 2.0 (the "License");
  *     you may not use this file except in compliance with the License.
@@ -26,118 +26,59 @@ import java.util.logging.Logger;
  * when delta plans cannot reach the desired version.
  */
 public class SnapshotForkRecoveryStrategy implements DeltaForkRecoveryStrategy {
+
+    private final HollowConsumer.BlobRetriever blobRetriever;
+    private final HollowDeltaUpdatePlanner deltaUpdatePlanner;
     private static final Logger LOG = Logger.getLogger(SnapshotForkRecoveryStrategy.class.getName());
+
+    public SnapshotForkRecoveryStrategy(HollowConsumer.BlobRetriever blobRetriever) {
+        this.blobRetriever = blobRetriever;
+        this.deltaUpdatePlanner = new HollowDeltaUpdatePlanner(blobRetriever);
+    }
 
     @Override
     public HollowUpdatePlan createRecoveryPlan(
             long currentVersion,
             HollowConsumer.VersionInfo desiredVersionInfo,
-            HollowConsumer.BlobRetriever blobRetriever,
-            HollowConsumer.DoubleSnapshotConfig doubleSnapshotConfig,
             HollowConsumer.UpdatePlanBlobVerifier updatePlanBlobVerifier) throws Exception {
         
         LOG.info("Attempting snapshot-based recovery for version transition: " 
                 + currentVersion + " -> " + desiredVersionInfo.getVersion());
         
-        return createSnapshotPlan(desiredVersionInfo, blobRetriever, updatePlanBlobVerifier);
+        return snapshotPlan(desiredVersionInfo, updatePlanBlobVerifier);
     }
 
     /**
-     * Creates a snapshot-based update plan.
-     * This method replicates the logic from HollowUpdatePlanner.snapshotPlan().
+     * Returns an update plan that if executed will update the client to a version that is either equal to or as close to but
+     * less than the desired version as possible. This plan normally contains one snapshot transition and zero or more delta
+     * transitions but if no previous versions were found then an empty plan, {@code HollowUpdatePlan.DO_NOTHING}, is returned.
+     * @param desiredVersionInfo Version info for the desired version to which the client wishes to update to, or update to as close to as possible but lesser than this version
+     * @return An update plan containing 1 snapshot transition and 0+ delta transitions if requested versions were found,
+     *         or an empty plan, {@code HollowUpdatePlan.DO_NOTHING}, if no previous versions were found
      */
-    private HollowUpdatePlan createSnapshotPlan(
-            HollowConsumer.VersionInfo desiredVersionInfo,
-            HollowConsumer.BlobRetriever blobRetriever,
-            HollowConsumer.UpdatePlanBlobVerifier updatePlanBlobVerifier) {
-        
+    private HollowUpdatePlan snapshotPlan(HollowConsumer.VersionInfo desiredVersionInfo,
+                                          HollowConsumer.UpdatePlanBlobVerifier updatePlanBlobVerifier) throws Exception {
         HollowUpdatePlan plan = new HollowUpdatePlan();
         long desiredVersion = desiredVersionInfo.getVersion();
-        long nearestPreviousSnapshotVersion = includeNearestSnapshot(plan, desiredVersionInfo, blobRetriever, updatePlanBlobVerifier);
+        long nearestPreviousSnapshotVersion = includeNearestSnapshot(plan, desiredVersionInfo, updatePlanBlobVerifier);
 
-        // The includeNearestSnapshot function returns a snapshot version that is less than or equal to the desired version
+        // The includeNearestSnapshot function returns a  snapshot version that is less than or equal to the desired version
         if(nearestPreviousSnapshotVersion > desiredVersion)
             return HollowUpdatePlan.DO_NOTHING;
 
-        // If the nearest snapshot version is HollowConstants.VERSION_LATEST then no past snapshots were found
+        // If the nearest snapshot version is {@code HollowConstants.VERSION_LATEST} then no past snapshots were found, so
+        // skip the delta planning and the update plan does nothing
         if(nearestPreviousSnapshotVersion == HollowConstants.VERSION_LATEST)
             return HollowUpdatePlan.DO_NOTHING;
 
-        plan.appendPlan(createDeltaPlan(nearestPreviousSnapshotVersion, desiredVersion, Integer.MAX_VALUE, blobRetriever));
+        plan.appendPlan(this.deltaUpdatePlanner.deltaPlan(nearestPreviousSnapshotVersion, desiredVersion, Integer.MAX_VALUE));
 
         return plan;
     }
 
-    /**
-     * Creates a delta plan from current version to desired version.
-     * This method replicates the logic from HollowUpdatePlanner.deltaPlan().
-     */
-    private HollowUpdatePlan createDeltaPlan(long currentVersion, long desiredVersion, int maxDeltas, HollowConsumer.BlobRetriever blobRetriever) {
-        HollowUpdatePlan plan = new HollowUpdatePlan();
-        if(currentVersion < desiredVersion) {
-            applyForwardDeltasToPlan(currentVersion, desiredVersion, plan, maxDeltas, blobRetriever);
-        } else if(currentVersion > desiredVersion) {
-            applyReverseDeltasToPlan(currentVersion, desiredVersion, plan, maxDeltas, blobRetriever);
-        }
-        return plan;
-    }
-
-    private long applyForwardDeltasToPlan(long currentVersion, long desiredVersion, HollowUpdatePlan plan, int maxDeltas, HollowConsumer.BlobRetriever blobRetriever) {
-        int transitionCounter = 0;
-
-        while(currentVersion < desiredVersion && transitionCounter < maxDeltas) {
-            currentVersion = includeNextDelta(plan, currentVersion, desiredVersion, blobRetriever);
-            transitionCounter++;
-        }
-        return currentVersion;
-    }
-
-    private long applyReverseDeltasToPlan(long currentVersion, long desiredVersion, HollowUpdatePlan plan, int maxDeltas, HollowConsumer.BlobRetriever blobRetriever) {
-        long achievedVersion = currentVersion;
-        int transitionCounter = 0;
-
-        while (currentVersion > desiredVersion && transitionCounter < maxDeltas) {
-            currentVersion = includeNextReverseDelta(plan, currentVersion, blobRetriever);
-            if (currentVersion != HollowConstants.VERSION_NONE)
-                achievedVersion = currentVersion;
-            transitionCounter++;
-        }
-
-        return achievedVersion;
-    }
-
-    /**
-     * Includes the next delta only if it will not take us *after* the desired version
-     */
-    private long includeNextDelta(HollowUpdatePlan plan, long currentVersion, long desiredVersion, HollowConsumer.BlobRetriever blobRetriever) {
-        HollowConsumer.Blob transition = blobRetriever.retrieveDeltaBlob(currentVersion);
-
-        if(transition != null) {
-            if(transition.getToVersion() <= desiredVersion) {
-                plan.add(transition);
-            }
-
-            return transition.getToVersion();
-        }
-
-        return HollowConstants.VERSION_LATEST;
-    }
-
-    private long includeNextReverseDelta(HollowUpdatePlan plan, long currentVersion, HollowConsumer.BlobRetriever blobRetriever) {
-        HollowConsumer.Blob transition = blobRetriever.retrieveReverseDeltaBlob(currentVersion);
-        if(transition != null) {
-            plan.add(transition);
-            return transition.getToVersion();
-        }
-
-        return HollowConstants.VERSION_NONE;
-    }
-
-    /**
-     * This method replicates the logic from HollowUpdatePlanner.includeNearestSnapshot().
-     */
-    private long includeNearestSnapshot(HollowUpdatePlan plan, HollowConsumer.VersionInfo desiredVersionInfo, 
-                                       HollowConsumer.BlobRetriever blobRetriever, HollowConsumer.UpdatePlanBlobVerifier updatePlanBlobVerifier) {
+    private long includeNearestSnapshot(HollowUpdatePlan plan,
+                                        HollowConsumer.VersionInfo desiredVersionInfo,
+                                        HollowConsumer.UpdatePlanBlobVerifier updatePlanBlobVerifier) {
         long desiredVersion = desiredVersionInfo.getVersion();
         HollowConsumer.Blob transition = blobRetriever.retrieveSnapshotBlob(desiredVersion);
         if (transition != null) {
@@ -149,10 +90,10 @@ public class SnapshotForkRecoveryStrategy implements DeltaForkRecoveryStrategy {
 
             // else if update is to an announced version then add only announced versions to plan
             if (updatePlanBlobVerifier != null
-                && updatePlanBlobVerifier.announcementVerificationEnabled()
-                && desiredVersionInfo.wasAnnounced() != null
-                && desiredVersionInfo.wasAnnounced().isPresent()
-                && desiredVersionInfo.wasAnnounced().get()) {
+                    && updatePlanBlobVerifier.announcementVerificationEnabled()
+                    && desiredVersionInfo.wasAnnounced() != null
+                    && desiredVersionInfo.wasAnnounced().isPresent()
+                    && desiredVersionInfo.wasAnnounced().get()) {
 
                 int lookback = 1;
                 int maxLookback = updatePlanBlobVerifier.announcementVerificationMaxLookback();
@@ -162,8 +103,8 @@ public class SnapshotForkRecoveryStrategy implements DeltaForkRecoveryStrategy {
                             ? HollowConsumer.AnnouncementStatus.UNKNOWN : announcementWatcher.getVersionAnnouncementStatus(transition.getToVersion());
 
                     if (announcementStatus == null
-                     || announcementStatus.equals(HollowConsumer.AnnouncementStatus.UNKNOWN)
-                     || announcementStatus.equals(HollowConsumer.AnnouncementStatus.ANNOUNCED)) {
+                            || announcementStatus.equals(HollowConsumer.AnnouncementStatus.UNKNOWN)
+                            || announcementStatus.equals(HollowConsumer.AnnouncementStatus.ANNOUNCED)) {
                         // backwards compatibility
                         if (announcementStatus == HollowConsumer.AnnouncementStatus.UNKNOWN) {
                             if (announcementWatcher == null) {
@@ -180,7 +121,7 @@ public class SnapshotForkRecoveryStrategy implements DeltaForkRecoveryStrategy {
                         plan.add(transition);
                         return transition.getToVersion();
                     }
-                    lookback ++;
+                    lookback++;
                     desiredVersion = transition.getToVersion() - 1; // try the next highest snapshot version less than the previous one
                     transition = blobRetriever.retrieveSnapshotBlob(desiredVersion);
                     if (transition == null) {

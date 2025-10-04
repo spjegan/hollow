@@ -27,7 +27,7 @@ public class LCAForkRecoveryConfig {
      */
     public static final LCAForkRecoveryConfig DEFAULT_CONFIG = new LCAForkRecoveryConfig(100);
     
-    private final int maxReverseDeltaLookback;
+    private int maxReverseDeltaLookback = 20; // Default value, can be overridden via constructor or builder.
     
     /**
      * Creates a new configuration with the specified maximum reverse delta lookback.
@@ -53,16 +53,6 @@ public class LCAForkRecoveryConfig {
      */
     public int getMaxReverseDeltaLookback() {
         return maxReverseDeltaLookback;
-    }
-    
-    /**
-     * Returns the search budget per direction for bidirectional search.
-     * This is half of the total lookback limit.
-     * 
-     * @return the budget per direction
-     */
-    public int getBudgetPerDirection() {
-        return Math.max(1, maxReverseDeltaLookback / 2);
     }
     
     /**
@@ -109,7 +99,6 @@ public class LCAForkRecoveryConfig {
     public String toString() {
         return "LCAForkRecoveryConfig{" +
                 "maxReverseDeltaLookback=" + maxReverseDeltaLookback +
-                ", budgetPerDirection=" + getBudgetPerDirection() +
                 '}';
     }
     
