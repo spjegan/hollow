@@ -18,3 +18,18 @@ tasks.withType(JavaCompile).configureEach {
 jmh {
   duplicateClassesStrategy = DuplicatesStrategy.WARN
 }
+
+// Producer integrity-phase benchmark (not JMH — long, millions of records).
+// e.g. ./gradlew :hollow-perf:producerIntegrityBenchmark -Precords=5000000 -PshardSize=33554432 -Pmode=both -PbenchHeap=24g
+tasks.register('producerIntegrityBenchmark', JavaExec) {
+  group = 'benchmark'
+  description = 'Runs the producer integrity-phase benchmark (parallel per-shard checksum off vs on).'
+  classpath = sourceSets.main.runtimeClasspath
+  mainClass = 'com.netflix.hollow.perf.producer.ProducerIntegrityBenchmark'
+  maxHeapSize = (project.findProperty('benchHeap') ?: '16g')
+  args = [
+    (project.findProperty('records') ?: '5000000').toString(),
+    (project.findProperty('shardSize') ?: '33554432').toString(),
+    (project.findProperty('mode') ?: 'both').toString()
+  ]
+}
