@@ -28,6 +28,7 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 import org.junit.Test;
 
 public class HollowAPICachingCodeGenTest extends AbstractHollowAPIGeneratorTest {
@@ -43,12 +44,14 @@ public class HollowAPICachingCodeGenTest extends AbstractHollowAPIGeneratorTest 
         assertNotNull(apiClass.getConstructor(
                 HollowDataAccess.class, Set.class, Map.class, apiClass, boolean.class));
 
-        // ...and the flag must be threaded into the object cache providers it builds.
+        // ...and the flag must be threaded into the object cache providers it builds, as an actual constructor
+        // argument (not merely mentioned somewhere in the source, e.g. in a comment or unused variable).
         String generated = new String(
                 Files.readAllBytes(Paths.get(sourceFolder, "codegen/api/API.java")), StandardCharsets.UTF_8);
-        assertTrue("generated API should pass retainRemovedOrdinalsInCache to HollowObjectCacheProvider",
-                generated.contains("new HollowObjectCacheProvider(")
-                        && generated.contains("retainRemovedOrdinalsInCache"));
+        Pattern newCacheProviderWithFlag = Pattern.compile(
+                "new HollowObjectCacheProvider\\([^)]*retainRemovedOrdinalsInCache[^)]*\\)");
+        assertTrue("generated API should pass retainRemovedOrdinalsInCache as an argument to HollowObjectCacheProvider",
+                newCacheProviderWithFlag.matcher(generated).find());
     }
 
     @SuppressWarnings("unused")

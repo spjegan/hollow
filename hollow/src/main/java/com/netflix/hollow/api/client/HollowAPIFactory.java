@@ -107,7 +107,7 @@ public interface HollowAPIFactory {
         public T createAPI(HollowDataAccess dataAccess, HollowAPI previousCycleAPI) {
             if (retainRemovedOrdinals) {
                 try {
-                    return retainAwareConstructor.newInstance(dataAccess, cachedTypes, Collections.emptyMap(), previousCycleAPI, true);
+                    return retainAwareConstructor.newInstance(dataAccess, cachedTypes, Collections.emptyMap(), previousCycleAPI, retainRemovedOrdinals);
                 } catch (Exception e) {
                     throw new RuntimeException(e);
                 }
