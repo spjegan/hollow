@@ -41,7 +41,6 @@ public class HollowObjectCacheProvider<T> extends HollowObjectProvider<T> implem
     private volatile HollowFactory<T> factory;
     private volatile HollowTypeAPI typeAPI;
     private volatile HollowTypeReadState typeReadState;
-    private final boolean retainRemovedOrdinals;
 
     public HollowObjectCacheProvider(HollowTypeDataAccess typeDataAccess, HollowTypeAPI typeAPI, HollowFactory<T> factory) {
         this(typeDataAccess, typeAPI, factory, null);
@@ -52,7 +51,6 @@ public class HollowObjectCacheProvider<T> extends HollowObjectProvider<T> implem
     }
 
     public HollowObjectCacheProvider(HollowTypeDataAccess typeDataAccess, HollowTypeAPI typeAPI, HollowFactory<T> factory, HollowObjectCacheProvider<T> previous, boolean retainRemovedOrdinals) {
-        this.retainRemovedOrdinals = retainRemovedOrdinals;
         if(typeDataAccess != null) {
             PopulatedOrdinalListener listener = typeDataAccess.getTypeState().getListener(PopulatedOrdinalListener.class);
             BitSet populatedOrdinals = listener.getPopulatedOrdinals();
